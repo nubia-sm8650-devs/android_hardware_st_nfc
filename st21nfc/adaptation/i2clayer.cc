@@ -24,12 +24,15 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/input.h> /* not required for all builds */
+#include <linux/nfc.h>
+#include <linux/sockios.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "android_logmsg.h"
@@ -48,6 +51,13 @@
 #define ST21NFC_CLK_ENABLE _IOR(ST21NFC_MAGIC, 0x11, unsigned int)
 #define ST21NFC_CLK_DISABLE _IOR(ST21NFC_MAGIC, 0x12, unsigned int)
 
+#ifndef NFC_SOCKPROTO_NCI
+#define NFC_SOCKPROTO_NCI 2
+#endif
+#ifndef SIOCNCIHWRESET
+#define SIOCNCIHWRESET (SIOCPROTOPRIVATE + 0)
+#endif
+
 #define LINUX_DBGBUFFER_SIZE 300
 #define I2C_ERROR_COUNT_MAX 50
 
@@ -56,6 +66,8 @@ static int cmdPipe[2] = {0, 0};
 static int notifyResetRequest = 0;
 static bool recovery_mode = false;
 static uint16_t i2c_error_count = 0;
+static bool nciSocket = false;
+static bool nciSocketDead = false;
 
 static struct pollfd event_table[3];
 static pthread_t threadHandle = (pthread_t)NULL;
@@ -76,6 +88,8 @@ static int SetToRecoveryMode(int fid);
 static int i2cRead(int fid, uint8_t* pvBuffer, int length);
 static int i2cGetGPIOState(int fid);
 static int i2cWrite(int fd, const uint8_t* pvBuffer, int length);
+static int nciSocketOpen(unsigned long devIdx);
+static void nciSocketRead(HALHANDLE hHAL);
 
 /**************************************************************************************************
  *
@@ -97,7 +111,7 @@ static void* I2cWorkerThread(void* arg) {
   bool resetting = false;
 
   do {
-    event_table[0].fd = fidI2c;
+    event_table[0].fd = nciSocketDead ? -1 : fidI2c;
     event_table[0].events = POLLIN;
     event_table[0].revents = 0;
 
@@ -123,7 +137,9 @@ static void* I2cWorkerThread(void* arg) {
       break;
     }
 
-    if (event_table[0].revents & POLLIN) {
+    if (nciSocket && (event_table[0].revents & (POLLIN | POLLERR | POLLHUP))) {
+      nciSocketRead(hHAL);
+    } else if (event_table[0].revents & POLLIN) {
       STLOG_HAL_V("echo thread wakeup from chip...\n");
       uint8_t buffer[300];
       int count = 0;
@@ -310,11 +326,32 @@ bool I2cOpenLayer(void* dev, HAL_CALLBACK callb, HALHANDLE* pHandle) {
 
   (void)pthread_mutex_lock(&i2ctransport_mtx);
 
-  fidI2c = open(nfc_dev_node, O_RDWR);
-  if (fidI2c < 0) {
-    STLOG_HAL_W("unable to open %s (%s) \n", nfc_dev_node, strerror(errno));
-    (void)pthread_mutex_unlock(&i2ctransport_mtx);
-    return false;
+  unsigned long nciDevIdx = 0;
+
+  nciSocket = GetNumValue(NAME_ST_NFC_NCI_DEV_IDX, &nciDevIdx,
+                          sizeof(nciDevIdx));
+  nciSocketDead = false;
+
+  if (!nciSocket) {
+    fidI2c = open(nfc_dev_node, O_RDWR);
+    if (fidI2c < 0 && errno == ENOENT) {
+      nciSocket = true;
+    } else if (fidI2c < 0) {
+      STLOG_HAL_W("unable to open %s (%s) \n", nfc_dev_node, strerror(errno));
+      (void)pthread_mutex_unlock(&i2ctransport_mtx);
+      return false;
+    }
+  }
+
+  if (nciSocket) {
+    fidI2c = nciSocketOpen(nciDevIdx);
+    if (fidI2c < 0) {
+      STLOG_HAL_W("unable to bind the NCI socket of nfc%lu (%s)\n", nciDevIdx,
+                  strerror(errno));
+      (void)pthread_mutex_unlock(&i2ctransport_mtx);
+      return false;
+    }
+    STLOG_HAL_D("Using the NCI socket of nfc%lu\n", nciDevIdx);
   }
 
   GetNumValue(NAME_STNFC_CONTROL_CLK, &hal_ctrl_clk, sizeof(hal_ctrl_clk));
@@ -420,6 +457,8 @@ static int i2cSetPolarity(int fid, bool low, bool edge) {
   int result;
   unsigned int io_code;
 
+  if (nciSocket) return 0;
+
   if (low) {
     if (edge) {
       io_code = ST21NFC_SET_POLARITY_FALLING;
@@ -449,8 +488,9 @@ static int i2cSetPolarity(int fid, bool low, bool edge) {
  */
 static int i2cResetPulse(int fid) {
   int result;
+  unsigned long io_code = nciSocket ? SIOCNCIHWRESET : ST21NFC_PULSE_RESET;
 
-  if (-1 == (result = ioctl(fid, ST21NFC_PULSE_RESET, NULL))) {
+  if (-1 == (result = ioctl(fid, io_code, NULL))) {
     result = -1;
   }
   STLOG_HAL_D("! i2cResetPulse!!, result = %d", result);
@@ -464,8 +504,9 @@ static int i2cResetPulse(int fid) {
  */
 static int SetToRecoveryMode(int fid) {
   int result;
+  unsigned long io_code = nciSocket ? SIOCNCIHWRESET : ST21NFC_RECOVERY;
 
-  if (-1 == (result = ioctl(fid, ST21NFC_RECOVERY, NULL))) {
+  if (-1 == (result = ioctl(fid, io_code, NULL))) {
     result = -1;
   }
   STLOG_HAL_D("! SetToRecoveryMode!!, result = %d", result);
@@ -615,9 +656,69 @@ static int i2cRead(int fid, uint8_t* pvBuffer, int length) {
 static int i2cGetGPIOState(int fid) {
   int result;
 
+  if (nciSocket) return 0;
+
   if (-1 == (result = ioctl(fid, ST21NFC_GET_WAKEUP, NULL))) {
     result = -1;
   }
 
   return result;
 } /* i2cGetGPIOState */
+
+/**
+ * Open the NCI user channel of an NFC device. The kernel opens the
+ * transport and passes whole NCI packets through it unchanged.
+ * @param devIdx NFC device index, as in nfc<devIdx>
+ * @return Socket descriptor, -1 if error
+ */
+static int nciSocketOpen(unsigned long devIdx) {
+  struct sockaddr_nfc addr = {};
+  int fd;
+
+  fd = socket(AF_NFC, SOCK_SEQPACKET | SOCK_CLOEXEC, NFC_SOCKPROTO_NCI);
+  if (fd < 0) return -1;
+
+  addr.sa_family = AF_NFC;
+  addr.dev_idx = devIdx;
+  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    int err = errno;
+    close(fd);
+    errno = err;
+    return -1;
+  }
+
+  return fd;
+} /* nciSocketOpen */
+
+/**
+ * Read one NCI packet from the NCI socket and pass it to the HAL core.
+ * @param hHAL HAL handle
+ */
+static void nciSocketRead(HALHANDLE hHAL) {
+  uint8_t buffer[300];
+  ssize_t bytesRead;
+
+  bytesRead = recv(fidI2c, buffer, sizeof(buffer), MSG_DONTWAIT);
+  if (bytesRead < 0) {
+    if (errno == EINTR || errno == EAGAIN) return;
+    STLOG_HAL_E("! NCI socket read failed (%s)\n", strerror(errno));
+    nciSocketDead = true;
+    return;
+  }
+  if (bytesRead == 0) {
+    STLOG_HAL_E("! NCI socket closed by the kernel\n");
+    nciSocketDead = true;
+    return;
+  }
+  if (bytesRead < 3) {
+    STLOG_HAL_E("! short NCI packet (%zd bytes)\n", bytesRead);
+    return;
+  }
+
+  if ((buffer[0] == 0x6f) && (buffer[1] == 0x02)) {
+    if (mDisplayFwLog) DispHal("RX DATA", buffer, bytesRead);
+  } else {
+    DispHal("RX DATA", buffer, bytesRead);
+  }
+  HalSendUpstream(hHAL, buffer, bytesRead);
+} /* nciSocketRead */
